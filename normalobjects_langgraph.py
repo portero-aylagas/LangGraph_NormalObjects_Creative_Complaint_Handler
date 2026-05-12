@@ -1,6 +1,7 @@
 import json
 import os
-from datetime import date, datetime
+import re
+from datetime import date, datetime, time, timedelta
 from typing import Any, TypedDict
 
 from dotenv import load_dotenv
@@ -13,8 +14,22 @@ load_dotenv()
 
 SUPPORTED_CATEGORIES = {"portal", "monster", "psychic", "environmental"}
 ALL_CATEGORIES = SUPPORTED_CATEGORIES | {"other"}
-TODAY = date(2026, 5, 12)
 MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+STAGE_ICONS = {
+    "INTAKE": "📥",
+    "VALIDATE": "✅",
+    "INVESTIGATE": "🔎",
+    "RESOLVE": "🛠️",
+    "CLOSE": "🔒",
+}
+RELATIVE_DATE_PATTERN = re.compile(
+    r"\b(today|tonight|yesterday|tomorrow|last night|this morning|this afternoon|this evening)\b",
+    re.IGNORECASE,
+)
+TIME_PATTERN = re.compile(
+    r"\b(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?\b",
+    re.IGNORECASE,
+)
 
 
 class ComplaintState(TypedDict, total=False):
@@ -76,12 +91,55 @@ COMPLAINT_DATABASE: list[dict[str, str]] = [
 ]
 
 
+DOWNSIDE_UP_PROTOCOLS: dict[str, list[dict[str, str]]] = {
+    "portal": [
+        {
+            "protocol_id": "DU-PORTAL-01",
+            "protocol_name": "Portal Timing Stabilization",
+            "procedure": "Stabilize reported portal timing and recheck the portal location against the complaint details.",
+            "specialized_team": "",
+        }
+    ],
+    "monster": [
+        {
+            "protocol_id": "DU-MONSTER-01",
+            "protocol_name": "Creature Behavior Containment",
+            "procedure": "Contain the reported creature behavior pattern and escalate if the investigation risk is high or unknown.",
+            "specialized_team": "Monster Response Unit",
+        }
+    ],
+    "psychic": [
+        {
+            "protocol_id": "DU-PSYCHIC-01",
+            "protocol_name": "Psychic Ability Baseline Review",
+            "procedure": "Compare the reported psychic limitation with the expected ability baseline and recommend rest or retesting.",
+            "specialized_team": "",
+        }
+    ],
+    "environmental": [
+        {
+            "protocol_id": "DU-ENV-01",
+            "protocol_name": "Environmental Anomaly Isolation",
+            "procedure": "Isolate the reported electrical, weather, or physical anomaly and escalate if risk is high or unknown.",
+            "specialized_team": "Environmental Anomaly Team",
+        }
+    ],
+}
+RESOLUTION_RESULTS = {"applied", "blocked", "escalated", "linked_case"}
+EFFECTIVENESS_RATINGS = {"high", "medium", "low"}
+SATISFACTION_STATUSES = {"satisfied", "unsatisfied", "unreachable", "pending"}
+
+
 def _llm() -> ChatOpenAI:
     if not os.getenv("OPENAI_API_KEY"):
         raise ValueError(
             "OPENAI_API_KEY not found. Add it to your environment or .env file."
         )
     return ChatOpenAI(model=MODEL_NAME, temperature=0)
+
+
+def _stage_label(stage: str) -> str:
+    return f"{STAGE_ICONS[stage]} [{stage}]"
 
 
 def _strip_code_fence(content: str) -> str:
@@ -122,27 +180,115 @@ def _parse_date(value: str | None) -> date | None:
         return None
 
 
+def _today() -> date:
+    return date.today()
+
+
 def _state_date(state: ComplaintState) -> date:
     return (
         _parse_date(state.get("submitted_at"))
         or _parse_date(state.get("occurred_at"))
-        or TODAY
+        or _today()
     )
 
 
-def _normalise_for_matching(value: str) -> str:
-    characters = [char.lower() if char.isalnum() else " " for char in value]
-    return " ".join("".join(characters).split())
+def _parse_time_from_phrase(value: str) -> time | None:
+    match = TIME_PATTERN.search(value.replace(".", ""))
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = (match.group(3) or "").lower().replace(".", "")
+
+    if minute > 59:
+        return None
+    if meridiem:
+        if not 1 <= hour <= 12:
+            return None
+        if meridiem.startswith("p") and hour != 12:
+            hour += 12
+        elif meridiem.startswith("a") and hour == 12:
+            hour = 0
+    elif not 0 <= hour <= 23:
+        return None
+
+    return time(hour=hour, minute=minute)
 
 
-def _similar_signature(left: str, right: str) -> bool:
-    left_words = set(_normalise_for_matching(left).split())
-    right_words = set(_normalise_for_matching(right).split())
-    if not left_words or not right_words:
-        return False
-    overlap = len(left_words & right_words)
-    smaller_size = min(len(left_words), len(right_words))
-    return overlap / smaller_size >= 0.7
+def _normalise_relative_datetime(
+    value: str | None, reference_date: date | None = None
+) -> str:
+    if not value:
+        return ""
+
+    text = value.strip()
+    if not text:
+        return ""
+
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
+        pass
+
+    try:
+        return datetime.fromisoformat(text).isoformat(timespec="minutes")
+    except ValueError:
+        pass
+
+    lowered = text.lower()
+    base_date = reference_date or _today()
+    if "day before yesterday" in lowered:
+        occurred_date = base_date - timedelta(days=2)
+    elif "yesterday" in lowered or "last night" in lowered:
+        occurred_date = base_date - timedelta(days=1)
+    elif "tomorrow" in lowered:
+        occurred_date = base_date + timedelta(days=1)
+    elif RELATIVE_DATE_PATTERN.search(lowered):
+        occurred_date = base_date
+    else:
+        return text
+
+    parsed_time = _parse_time_from_phrase(text)
+    if parsed_time:
+        return datetime.combine(occurred_date, parsed_time).isoformat(timespec="minutes")
+    return occurred_date.isoformat()
+
+
+def _same_issue_with_llm(
+    state: ComplaintState, issue_signature: str, record: dict[str, str]
+) -> bool:
+    result = _llm_json(
+        "You compare complaint records for duplicate detection. Return strict JSON only.",
+        f"""
+Decide whether these two complaint records describe the same underlying issue.
+
+Rules:
+- Match based on the recurring issue, not exact wording.
+- Treat small wording differences as the same issue if the complainant would reasonably be following up about the same problem.
+- Do not match merely because both records are in the same broad category.
+
+Current complaint:
+{json.dumps({
+    "complaint": state.get("complaint", ""),
+    "complainant": state.get("complainant", ""),
+    "category": state.get("category", ""),
+    "location": state.get("location", ""),
+    "occurred_at": state.get("occurred_at", ""),
+    "issue_signature": issue_signature,
+}, indent=2)}
+
+Existing record:
+{json.dumps(record, indent=2)}
+
+Return JSON with this shape:
+{{
+  "same_issue": true,
+  "reasoning": "short reason"
+}}
+""",
+    )
+    return bool(result.get("same_issue"))
 
 
 def _categorize_complaint(state: ComplaintState) -> tuple[str, str]:
@@ -189,7 +335,7 @@ Rules:
 - If a value is not stated, return an empty string for that field.
 - complainant is the person or organization making the complaint, if named.
 - occurred_at should be an ISO date if the complaint gives a specific date.
-- If the complaint only gives a relative date such as today, yesterday, or last night, keep that phrase.
+- If the complaint gives a relative date or time such as today, today at 9, yesterday, or last night, keep the full relative phrase.
 - location is where the issue happened, if stated.
 
 Complaint text:
@@ -338,21 +484,20 @@ def _find_related_complaints(
 
     for record in COMPLAINT_DATABASE:
         same_complainant = complainant and complainant == record["complainant"].lower()
+        same_category = state.get("category") == record.get("category")
         record_date = _parse_date(record.get("submitted_at"))
-        if not record_date:
+        if not record_date or not same_category:
             continue
 
         age_days = abs((submitted_at - record_date).days)
-        exact_signature = _normalise_for_matching(issue_signature) == _normalise_for_matching(
-            record["issue_signature"]
-        )
-        similar_signature = exact_signature or _similar_signature(
-            issue_signature, record["issue_signature"]
-        )
+        should_compare = (same_complainant and age_days <= 30) or age_days > 30
+        if not should_compare:
+            continue
 
-        if exact_signature and same_complainant and age_days <= 30:
+        same_issue = _same_issue_with_llm(state, issue_signature, record)
+        if same_issue and same_complainant and age_days <= 30:
             return record, historical
-        if similar_signature and age_days > 30:
+        if same_issue and age_days > 30:
             historical.append(record["complaint_id"])
 
     return None, historical
@@ -363,7 +508,7 @@ def _append_demo_record(state: ComplaintState) -> None:
         {
             "complaint_id": state["complaint_id"],
             "complainant": state.get("complainant", "Unknown"),
-            "submitted_at": state.get("submitted_at", TODAY.isoformat()),
+            "submitted_at": state.get("submitted_at", _today().isoformat()),
             "category": state["category"],
             "issue_signature": state["issue_signature"],
         }
@@ -372,18 +517,21 @@ def _append_demo_record(state: ComplaintState) -> None:
 
 def intake_node(state: ComplaintState) -> ComplaintState:
     """Step 1: LLM intake, category assignment, completeness, and related cases."""
-    print("\n[INTAKE] Processing complaint...")
+    print(f"\n{_stage_label('INTAKE')} Processing complaint...")
 
     complaint_id = state.get("complaint_id") or f"NO-DEMO-{len(COMPLAINT_DATABASE) + 1:03d}"
-    submitted_at = state.get("submitted_at")
+    submitted_at = _normalise_relative_datetime(state.get("submitted_at"))
+    reference_date = _parse_date(submitted_at) or _today()
 
     category, category_reasoning = _categorize_complaint(state)
     extracted_metadata = _extract_metadata(state)
+    occurred_at = state.get("occurred_at") or extracted_metadata["occurred_at"]
+    occurred_at = _normalise_relative_datetime(occurred_at, reference_date)
     intake_state: ComplaintState = {
         **state,
         "complaint_id": complaint_id,
         "complainant": state.get("complainant") or extracted_metadata["complainant"],
-        "occurred_at": state.get("occurred_at") or extracted_metadata["occurred_at"],
+        "occurred_at": occurred_at,
         "location": state.get("location") or extracted_metadata["location"],
         "category": category,
         "category_reasoning": category_reasoning,
@@ -398,7 +546,7 @@ def intake_node(state: ComplaintState) -> ComplaintState:
 
     new_state: ComplaintState = {
         **intake_state,
-        "submitted_at": submitted_at or TODAY.isoformat(),
+        "submitted_at": submitted_at or reference_date.isoformat(),
         "issue_signature": issue_signature,
         "needs_clarification": bool(missing_details),
         "missing_details": missing_details,
@@ -411,13 +559,13 @@ def intake_node(state: ComplaintState) -> ComplaintState:
     }
     _append_demo_record(new_state)
 
-    print(f"[INTAKE] Categorized as: {category}")
+    print(f"{_stage_label('INTAKE')} Categorized as: {category}")
     if missing_details:
-        print(f"[INTAKE] Missing details: {', '.join(missing_details)}")
+        print(f"{_stage_label('INTAKE')} Missing details: {', '.join(missing_details)}")
     if duplicate:
-        print(f"[INTAKE] Duplicate of: {duplicate['complaint_id']}")
+        print(f"{_stage_label('INTAKE')} Duplicate of: {duplicate['complaint_id']}")
     if historical:
-        print(f"[INTAKE] Historical similar cases: {', '.join(historical)}")
+        print(f"{_stage_label('INTAKE')} Historical similar cases: {', '.join(historical)}")
     return new_state
 
 
@@ -428,7 +576,7 @@ def process_complaint(complaint: str) -> ComplaintState:
 
 def validate_node(state: ComplaintState) -> ComplaintState:
     """Step 2: Apply validation priority order with LLM category validation."""
-    print("\n[VALIDATE] Validating complaint...")
+    print(f"\n{_stage_label('VALIDATE')} Validating complaint...")
 
     category = state.get("category", "other")
     missing_details = state.get("missing_details", [])
@@ -466,80 +614,419 @@ def validate_node(state: ComplaintState) -> ComplaintState:
         "status": status,
         "workflow_path": state.get("workflow_path", []) + ["validate"],
     }
-    print(f"[VALIDATE] Status: {status}")
+    print(f"{_stage_label('VALIDATE')} Status: {status}")
     return new_state
+
+
+def _investigate_with_llm(state: ComplaintState) -> dict[str, Any]:
+    status = state.get("status", "")
+    result = _llm_json(
+        "You are the investigation step in a strict complaint workflow. Return strict JSON only.",
+        f"""
+Create a structured investigation report for this complaint.
+
+Workflow status before investigation: {status}
+
+Rules:
+- This is a demo workflow. You may create plausible investigation findings from the complaint state, category, location, date, and issue description.
+- Do not claim that real external tools, logs, databases, sensors, or teams were actually checked.
+- Phrase invented findings as internal demo investigation conclusions, not verified outside evidence.
+- If status is pending_clarification, explain that investigation is blocked and list the missing details needed next.
+- If status is manual_review_required, explain that automated investigation is limited because the category is other.
+- If status is validation_failed, explain that investigation is blocked by validation failure.
+- If status is validated_duplicate, focus on linked-case guidance using duplicate_of.
+- If status is validated, create category-specific findings and list evidence that should be checked next.
+- Keep findings concrete and useful for the next resolution step.
+
+Complaint state:
+{json.dumps({
+    "complaint": state.get("complaint", ""),
+    "complaint_id": state.get("complaint_id", ""),
+    "complainant": state.get("complainant", ""),
+    "submitted_at": state.get("submitted_at", ""),
+    "occurred_at": state.get("occurred_at", ""),
+    "location": state.get("location", ""),
+    "category": state.get("category", ""),
+    "category_reasoning": state.get("category_reasoning", ""),
+    "issue_signature": state.get("issue_signature", ""),
+    "missing_details": state.get("missing_details", []),
+    "duplicate_detected": state.get("duplicate_detected", False),
+    "duplicate_of": state.get("duplicate_of"),
+    "historical_similar_cases": state.get("historical_similar_cases", []),
+    "validation_notes": state.get("validation_notes", []),
+    "is_valid": state.get("is_valid", False),
+    "status": status,
+}, indent=2)}
+
+Return JSON with exactly these top-level keys:
+{{
+  "result": "blocked|manual_review|linked_case|evidence_collected",
+  "summary": "one sentence investigation summary",
+  "findings": ["finding 1", "finding 2"],
+  "evidence_to_check": ["evidence item 1", "evidence item 2"],
+  "risk_level": "low|medium|high|unknown",
+  "recommended_next_action": "short action for the next workflow step",
+  "notes": "short note"
+}}
+""",
+    )
+
+    required_fields = {
+        "result": str,
+        "summary": str,
+        "findings": list,
+        "evidence_to_check": list,
+        "risk_level": str,
+        "recommended_next_action": str,
+        "notes": str,
+    }
+    missing_fields = [field for field in required_fields if field not in result]
+    if missing_fields:
+        raise ValueError(
+            f"LLM investigation response missing fields: {', '.join(missing_fields)}"
+        )
+
+    if not isinstance(result["findings"], list):
+        raise ValueError("LLM investigation response field 'findings' must be a list.")
+    if not isinstance(result["evidence_to_check"], list):
+        raise ValueError(
+            "LLM investigation response field 'evidence_to_check' must be a list."
+        )
+
+    return {
+        "result": str(result["result"]).strip(),
+        "summary": str(result["summary"]).strip(),
+        "findings": [str(item).strip() for item in result["findings"]],
+        "evidence_to_check": [
+            str(item).strip() for item in result["evidence_to_check"]
+        ],
+        "risk_level": str(result["risk_level"]).strip(),
+        "recommended_next_action": str(result["recommended_next_action"]).strip(),
+        "notes": str(result["notes"]).strip(),
+    }
 
 
 def investigate_node(state: ComplaintState) -> ComplaintState:
     """Step 3: Record an investigation result for every validation outcome."""
-    print("\n[INVESTIGATE] Investigating complaint...")
+    print(f"\n{_stage_label('INVESTIGATE')} Investigating complaint...")
 
-    status = state.get("status", "")
-    category = state.get("category", "other")
-
-    if status == "pending_clarification":
-        investigation = {
-            "result": "blocked",
-            "notes": f"Investigation blocked until these details are supplied: {', '.join(state.get('missing_details', []))}.",
-        }
-    elif status == "manual_review_required":
-        investigation = {
-            "result": "manual_review",
-            "notes": "Automated investigation is unavailable for other complaints.",
-        }
-    elif status == "validation_failed":
-        investigation = {
-            "result": "blocked",
-            "notes": "Investigation blocked because the complaint failed category validation.",
-        }
-    elif status == "validated_duplicate":
-        investigation = {
-            "result": "linked_case",
-            "notes": f"Use evidence and resolution history from linked case {state.get('duplicate_of')}.",
-        }
-    else:
-        evidence_notes = {
-            "portal": "Check portal timing logs, location drift records, and recent gate activity.",
-            "monster": "Review creature sighting reports, pack behavior notes, and containment logs.",
-            "psychic": "Compare claimed ability limits with prior psychic exertion and recovery records.",
-            "environmental": "Inspect power anomalies, weather readings, and affected physical infrastructure.",
-        }
-        investigation = {
-            "result": "evidence_collected",
-            "notes": evidence_notes.get(category, "No category-specific evidence path is available."),
-        }
+    investigation = _investigate_with_llm(state)
 
     new_state: ComplaintState = {
         **state,
         "investigation": investigation,
         "workflow_path": state.get("workflow_path", []) + ["investigate"],
     }
-    print(f"[INVESTIGATE] Result: {investigation['result']}")
+    print(f"{_stage_label('INVESTIGATE')} Result: {investigation['result']}")
     return new_state
 
 
+def _blocked_resolution(reason: str) -> dict[str, Any]:
+    return {
+        "result": "blocked",
+        "protocol_id": "",
+        "protocol_name": "",
+        "action": "No resolution applied.",
+        "effectiveness": "low",
+        "escalation_required": False,
+        "specialized_team": "",
+        "rationale": reason,
+        "notes": reason,
+    }
+
+
+def _linked_case_resolution(state: ComplaintState) -> dict[str, Any]:
+    duplicate_of = state.get("duplicate_of") or "the linked complaint"
+    return {
+        "result": "linked_case",
+        "protocol_id": "",
+        "protocol_name": "",
+        "action": f"Use the documented resolution path from linked case {duplicate_of}.",
+        "effectiveness": "medium",
+        "escalation_required": False,
+        "specialized_team": "",
+        "rationale": "Duplicate complaints should be consolidated instead of applying a new independent fix.",
+        "notes": f"Linked to existing case {duplicate_of}.",
+    }
+
+
+def _has_documented_investigation(state: ComplaintState) -> bool:
+    investigation = state.get("investigation")
+    if not isinstance(investigation, dict):
+        return False
+
+    result = str(investigation.get("result", "")).strip()
+    if result in {"blocked", "manual_review"}:
+        return False
+
+    findings = investigation.get("findings", [])
+    has_findings = isinstance(findings, list) and bool(findings)
+    return bool(
+        result
+        and (
+            str(investigation.get("summary", "")).strip()
+            or has_findings
+            or str(investigation.get("notes", "")).strip()
+        )
+    )
+
+
+def _bool_from_llm(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1"}
+    return bool(value)
+
+
+def _validate_resolution_response(
+    result: dict[str, Any], state: ComplaintState, protocols: list[dict[str, str]]
+) -> dict[str, Any]:
+    required_fields = {
+        "result": str,
+        "protocol_id": str,
+        "protocol_name": str,
+        "action": str,
+        "effectiveness": str,
+        "escalation_required": bool,
+        "specialized_team": str,
+        "rationale": str,
+        "notes": str,
+    }
+    missing_fields = [field for field in required_fields if field not in result]
+    if missing_fields:
+        raise ValueError(
+            f"LLM resolution response missing fields: {', '.join(missing_fields)}"
+        )
+
+    resolution_result = str(result["result"]).strip().lower()
+    if resolution_result not in RESOLUTION_RESULTS:
+        raise ValueError(f"Unknown resolution result: {result['result']}")
+
+    effectiveness = str(result["effectiveness"]).strip().lower()
+    if effectiveness not in EFFECTIVENESS_RATINGS:
+        raise ValueError(f"Unknown effectiveness rating: {result['effectiveness']}")
+
+    protocols_by_id = {protocol["protocol_id"]: protocol for protocol in protocols}
+    protocol_id = str(result["protocol_id"]).strip()
+    protocol = protocols_by_id.get(protocol_id)
+    if resolution_result in {"applied", "escalated"} and not protocol:
+        raise ValueError(f"Resolution used an unknown protocol_id: {protocol_id}")
+
+    category = state.get("category", "")
+    risk_level = str(state.get("investigation", {}).get("risk_level", "")).lower()
+    should_escalate = category in {"monster", "environmental"} and risk_level in {
+        "high",
+        "unknown",
+    }
+    if resolution_result in {"applied", "escalated"}:
+        resolution_result = "escalated" if should_escalate else "applied"
+        escalation_required = should_escalate
+        specialized_team = protocol["specialized_team"] if should_escalate else ""
+        protocol_name = protocol["protocol_name"]
+    else:
+        escalation_required = _bool_from_llm(result["escalation_required"])
+        specialized_team = str(result["specialized_team"]).strip()
+        protocol_name = str(result["protocol_name"]).strip()
+
+    return {
+        "result": resolution_result,
+        "protocol_id": protocol_id,
+        "protocol_name": protocol_name,
+        "action": str(result["action"]).strip(),
+        "effectiveness": effectiveness,
+        "escalation_required": escalation_required,
+        "specialized_team": specialized_team,
+        "rationale": str(result["rationale"]).strip(),
+        "notes": str(result["notes"]).strip(),
+    }
+
+
+def _resolve_with_llm(
+    state: ComplaintState, protocols: list[dict[str, str]]
+) -> dict[str, Any]:
+    result = _llm_json(
+        "You are the resolution step in a strict complaint workflow. Return strict JSON only.",
+        f"""
+Create a resolution for this investigated complaint.
+
+Rules:
+- Use the documented investigation result below. Do not apply a resolution without it.
+- Choose exactly one protocol_id from allowed_protocols.
+- The action must be specific to the complaint category.
+- The action must explicitly reference the selected Downside Up protocol.
+- Monster and environmental complaints with high or unknown risk must be escalated to the protocol's specialized_team.
+- Portal and psychic complaints should not escalate unless the protocol includes a specialized_team.
+- effectiveness must be exactly high, medium, or low.
+- Do not invent protocols that are not listed in allowed_protocols.
+
+Complaint state:
+{json.dumps({
+    "complaint": state.get("complaint", ""),
+    "complaint_id": state.get("complaint_id", ""),
+    "complainant": state.get("complainant", ""),
+    "submitted_at": state.get("submitted_at", ""),
+    "occurred_at": state.get("occurred_at", ""),
+    "location": state.get("location", ""),
+    "category": state.get("category", ""),
+    "category_reasoning": state.get("category_reasoning", ""),
+    "status": state.get("status", ""),
+    "issue_signature": state.get("issue_signature", ""),
+    "duplicate_detected": state.get("duplicate_detected", False),
+    "duplicate_of": state.get("duplicate_of"),
+    "investigation": state.get("investigation", {}),
+}, indent=2)}
+
+allowed_protocols:
+{json.dumps(protocols, indent=2)}
+
+Return JSON with exactly these top-level keys:
+{{
+  "result": "applied|blocked|escalated|linked_case",
+  "protocol_id": "one allowed protocol_id, or empty string if blocked/linked_case",
+  "protocol_name": "selected protocol name, or empty string if blocked/linked_case",
+  "action": "specific resolution action",
+  "effectiveness": "high|medium|low",
+  "escalation_required": true,
+  "specialized_team": "team name or empty string",
+  "rationale": "why this protocol fits the investigation",
+  "notes": "short note"
+}}
+""",
+    )
+    return _validate_resolution_response(result, state, protocols)
+
+
 def resolve_node(state: ComplaintState) -> ComplaintState:
-    """Step 4: Placeholder resolution node."""
-    print("\n[RESOLVE] Resolution placeholder...")
+    """Step 4: Apply category-specific resolution rules."""
+    print(f"\n{_stage_label('RESOLVE')} Resolving complaint...")
+
+    investigation = state.get("investigation", {})
+    if not _has_documented_investigation(state):
+        resolution = _blocked_resolution(
+            "No resolution can be applied without documented investigation results."
+        )
+    elif state.get("status") == "validated_duplicate" or investigation.get(
+        "result"
+    ) == "linked_case":
+        resolution = _linked_case_resolution(state)
+    else:
+        category = state.get("category", "other")
+        protocols = DOWNSIDE_UP_PROTOCOLS.get(category, [])
+        if not state.get("is_valid") or not protocols:
+            resolution = _blocked_resolution(
+                "No category-specific Downside Up protocol is available for this complaint."
+            )
+        else:
+            resolution = _resolve_with_llm(state, protocols)
+
+    print(f"{_stage_label('RESOLVE')} Result: {resolution['result']}")
     return {
         **state,
-        "resolution": {
-            "result": "not_implemented",
-            "notes": "Resolution logic will be added in a later pass.",
-        },
+        "resolution": resolution,
         "workflow_path": state.get("workflow_path", []) + ["resolve"],
     }
 
 
+def _customer_satisfaction_with_llm(state: ComplaintState) -> dict[str, str]:
+    result = _llm_json(
+        "You create demo-only customer satisfaction verification records. Return strict JSON only.",
+        f"""
+Create a customer satisfaction verification record for this complaint closure step.
+
+Rules:
+- This is a demo workflow record, not real customer outreach.
+- Do not claim that a real customer was contacted, called, emailed, surveyed, or interviewed.
+- Describe the verification as a demo satisfaction attempt/status based on the complaint and resolution state.
+- Use pending when the resolution is not applied or when satisfaction cannot be reasonably inferred.
+- Keep all fields short and operational.
+
+Complaint closure context:
+{json.dumps({
+    "complaint": state.get("complaint", ""),
+    "complaint_id": state.get("complaint_id", ""),
+    "complainant": state.get("complainant", ""),
+    "category": state.get("category", ""),
+    "status": state.get("status", ""),
+    "resolution": state.get("resolution", {}),
+}, indent=2)}
+
+Return JSON with exactly these top-level keys:
+{{
+  "status": "satisfied|unsatisfied|unreachable|pending",
+  "summary": "short summary",
+  "next_contact_action": "short action"
+}}
+""",
+    )
+
+    required_fields = {"status": str, "summary": str, "next_contact_action": str}
+    missing_fields = [field for field in required_fields if field not in result]
+    if missing_fields:
+        raise ValueError(
+            "LLM satisfaction response missing fields: "
+            + ", ".join(missing_fields)
+        )
+
+    satisfaction_status = str(result["status"]).strip().lower()
+    if satisfaction_status not in SATISFACTION_STATUSES:
+        raise ValueError(f"Unknown satisfaction status: {result['status']}")
+
+    return {
+        "status": satisfaction_status,
+        "summary": str(result["summary"]).strip(),
+        "next_contact_action": str(result["next_contact_action"]).strip(),
+    }
+
+
 def close_node(state: ComplaintState) -> ComplaintState:
-    """Step 5: Placeholder closure node."""
-    print("\n[CLOSE] Closure placeholder...")
+    """Step 5: Close only complaints with confirmed applied resolutions."""
+    print(f"\n{_stage_label('CLOSE')} Closing complaint...")
+
+    resolution = state.get("resolution", {})
+    resolution_result = str(resolution.get("result", "")).strip().lower()
+    resolution_confirmed = resolution_result == "applied"
+    closure_result = "closed" if resolution_confirmed else "pending_closure"
+    closure_timestamp = datetime.now().isoformat(timespec="seconds")
+
+    follow_up_required = str(resolution.get("effectiveness", "")).strip().lower() == "low"
+    follow_up_at = ""
+    if follow_up_required:
+        follow_up_date = datetime.fromisoformat(closure_timestamp).date() + timedelta(
+            days=30
+        )
+        follow_up_at = follow_up_date.isoformat()
+
+    customer_satisfaction = _customer_satisfaction_with_llm(state)
+    resolution_action = str(
+        resolution.get("action") or resolution.get("result") or "No resolution recorded."
+    ).strip()
+    notes = (
+        "Resolution application confirmed; complaint is fully closed."
+        if resolution_confirmed
+        else f"Closure remains pending because resolution result is {resolution_result or 'unknown'}."
+    )
+
+    closure = {
+        "result": closure_result,
+        "resolution_confirmed": resolution_confirmed,
+        "customer_satisfaction_attempted": True,
+        "customer_satisfaction": customer_satisfaction,
+        "closure_log": {
+            "category": state.get("category", "other"),
+            "resolution": resolution_action,
+            "outcome": closure_result,
+            "timestamp": closure_timestamp,
+        },
+        "follow_up_required": follow_up_required,
+        "follow_up_at": follow_up_at,
+        "notes": notes,
+    }
+
+    print(f"{_stage_label('CLOSE')} Result: {closure_result}")
     return {
         **state,
-        "closure": {
-            "result": "closed_for_demo",
-            "notes": "Complaint reached the end of the demo workflow.",
-        },
+        "closure": closure,
         "workflow_path": state.get("workflow_path", []) + ["close"],
     }
 
@@ -559,6 +1046,27 @@ workflow.add_edge("resolve", "close")
 workflow.add_edge("close", END)
 
 app = workflow.compile()
+
+
+def _format_demo_summary(state: ComplaintState) -> str:
+    resolution = state.get("resolution", {})
+    closure = state.get("closure", {})
+    workflow_path = " -> ".join(state.get("workflow_path", []))
+    summary_parts = [
+        f"id={state.get('complaint_id', 'unknown')}",
+        f"status={state.get('status', 'unknown')}",
+        f"category={state.get('category', 'unknown')}",
+        f"resolution={resolution.get('result', 'unknown')}",
+        f"closure={closure.get('result', 'unknown')}",
+        f"path={workflow_path}",
+    ]
+    duplicate_of = state.get("duplicate_of")
+    historical_cases = state.get("historical_similar_cases", [])
+    if duplicate_of:
+        summary_parts.append(f"duplicate_of={duplicate_of}")
+    if historical_cases:
+        summary_parts.append(f"historical={', '.join(historical_cases)}")
+    return "Final summary: " + " | ".join(summary_parts)
 
 
 def run_demo() -> None:
@@ -597,7 +1105,7 @@ def run_demo() -> None:
     for complaint in test_complaints:
         print(f"\nProcessing complaint: {complaint}")
         result = process_complaint(complaint)
-        print(f"Final state: {result}")
+        print(_format_demo_summary(result))
 
 
 if __name__ == "__main__":
