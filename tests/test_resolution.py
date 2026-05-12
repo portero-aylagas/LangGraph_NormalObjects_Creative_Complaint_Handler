@@ -2,62 +2,12 @@ from datetime import date
 
 import pytest
 
-import normalobjects_langgraph as workflow
-
-
-def test_strip_code_fence_removes_json_fence():
-    content = '```json\n{"result": "ok"}\n```'
-
-    assert workflow._strip_code_fence(content) == '{"result": "ok"}'
-
-
-@pytest.mark.parametrize(
-    ("phrase", "expected"),
-    [
-        ("Today at 9pm", "2026-05-12T21:00"),
-        ("yesterday at 6:30 am", "2026-05-11T06:30"),
-        ("last night", "2026-05-11"),
-        ("tomorrow", "2026-05-13"),
-        ("2026-05-01T14:45:30", "2026-05-01T14:45"),
-    ],
-)
-def test_normalise_relative_datetime(phrase, expected):
-    assert workflow._normalise_relative_datetime(phrase, date(2026, 5, 12)) == expected
-
-
-@pytest.mark.parametrize(
-    ("phrase", "expected"),
-    [
-        ("at 9pm", "21:00:00"),
-        ("6:30 am", "06:30:00"),
-        ("12am", "00:00:00"),
-        ("12pm", "12:00:00"),
-    ],
-)
-def test_parse_time_from_phrase(phrase, expected):
-    assert workflow._parse_time_from_phrase(phrase).isoformat() == expected
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        (True, True),
-        (False, False),
-        ("true", True),
-        ("yes", True),
-        ("1", True),
-        ("false", False),
-        ("no", False),
-        ("0", False),
-        ("", False),
-    ],
-)
-def test_bool_from_llm(value, expected):
-    assert workflow._bool_from_llm(value) is expected
+from normalobjects import demo, workflow
+from normalobjects.data import DOWNSIDE_UP_PROTOCOLS
 
 
 def test_validate_resolution_response_escalates_high_risk_monster_case():
-    protocols = workflow.DOWNSIDE_UP_PROTOCOLS["monster"]
+    protocols = DOWNSIDE_UP_PROTOCOLS["monster"]
     state = {
         "category": "monster",
         "investigation": {"risk_level": "high"},
@@ -82,7 +32,7 @@ def test_validate_resolution_response_escalates_high_risk_monster_case():
 
 
 def test_validate_resolution_response_rejects_unknown_protocol():
-    protocols = workflow.DOWNSIDE_UP_PROTOCOLS["portal"]
+    protocols = DOWNSIDE_UP_PROTOCOLS["portal"]
     state = {
         "category": "portal",
         "investigation": {"risk_level": "low"},
@@ -115,7 +65,7 @@ def test_format_demo_summary_includes_key_workflow_fields():
         "workflow_path": ["intake", "validate", "investigate", "resolve", "close"],
     }
 
-    summary = workflow._format_demo_summary(state)
+    summary = demo._format_demo_summary(state)
 
     assert "id=NO-DEMO-005" in summary
     assert "status=validated_duplicate" in summary
@@ -129,6 +79,7 @@ def test_format_demo_summary_includes_key_workflow_fields():
 def test_process_complaint_runs_full_graph_with_mocked_llm(monkeypatch):
     original_database = list(workflow.COMPLAINT_DATABASE)
     monkeypatch.setattr(workflow, "COMPLAINT_DATABASE", list(original_database))
+    monkeypatch.setattr(workflow, "_today", lambda: date(2026, 5, 12))
 
     def fake_llm_json(system_prompt, user_prompt):
         if "classify Downside Up complaint intake items" in system_prompt:
@@ -204,3 +155,4 @@ def test_process_complaint_runs_full_graph_with_mocked_llm(monkeypatch):
     assert result["resolution"]["result"] == "applied"
     assert result["closure"]["result"] == "closed"
     assert result["occurred_at"] == "2026-05-12T21:00"
+
